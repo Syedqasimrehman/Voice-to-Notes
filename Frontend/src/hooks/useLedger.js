@@ -24,6 +24,12 @@ export function useLedger() {
   const setProgressState = (text, pct) => setProgress({ show: true, text, pct: Math.round(pct) });
   const hideProgress = () => setProgress((p) => ({ ...p, show: false }));
 
+  const makeId = () => (
+    typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : Date.now().toString(36) + Math.random().toString(36).slice(2)
+  );
+
   const transcribeViaBackend = useCallback(async (float32) => {
     const wavBlob = encodeWav(float32, 16000);
     const form = new FormData();
@@ -34,6 +40,19 @@ export function useLedger() {
       throw new Error('Backend error: ' + detail);
     }
     const data = await res.json();
+
+    // Backend returns notes/tasks as plain string arrays; the rest of this
+    // hook (toggleTaskDone, moveToTasks/moveToNotes, copyNotes/copyTasks)
+    // expects { id, text, done } objects.
+    const toEntries = (arr) => (Array.isArray(arr) ? arr : []).map((text) => ({
+      id: makeId(),
+      text,
+      done: false,
+    }));
+
+    setNotes(toEntries(data.notes));
+    setTasks(toEntries(data.tasks));
+
     return data.text || '';
   }, [backendBase]);
 
@@ -71,20 +90,22 @@ export function useLedger() {
         return;
       }
       showTranscript(text);
-      runExtraction(text);
+      // runExtraction(text);
     } catch (err) {
       hideProgress();
       setSealLabel('Tap to record');
       showError('Transcription failed: ' + err.message);
     }
-  }, [checkBackend, backendBase, transcribeViaBackend, showTranscript, runExtraction]);
+  // }, [checkBackend, backendBase, transcribeViaBackend, showTranscript, runExtraction]);
+  }, [checkBackend, backendBase, transcribeViaBackend, showTranscript]);
 
   const handlePasteSubmit = useCallback((rawText) => {
     const txt = rawText.trim();
     if (!txt) return;
     showTranscript(txt);
-    runExtraction(txt);
-  }, [showTranscript, runExtraction]);
+    // runExtraction(txt);
+  // }, [showTranscript, runExtraction]);
+  }, [showTranscript]);
 
   const toggleTaskDone = (id) => {
     setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));

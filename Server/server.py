@@ -1,60 +1,185 @@
-"""
-Voice Ledger backend — transcribes Urdu audio with a fine-tuned Whisper model.
-
-Endpoints (matched to the frontend's useBackend / useLedger hooks):
-  GET  /health       -> { status, model }
-  POST /transcribe    -> { text }   (multipart/form-data, field name "file")
-  POST /translate      -> { translated, source_lang, target_lang }  (JSON body: { text, target? })
-
-Run:
-  pip install -r requirements.txt
-  BAZAARLINK_API_KEY=sk-bl-...   python server.py
-"""
-
+import datetime
 import io
+import sys
 import os
-import re
-from dotenv import load_dotenv
+import uuid
+from pathlib import Path
+import json
 import numpy as np
-import requests
 import soundfile as sf
 import torch
-import uvicorn
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, GenerationConfig
-
-load_dotenv()
-
-MODEL_ID = "Abdul145/whisper-medium-urdu-custom"
-TARGET_SR = 16000
-
-# --- BazaarLink (OpenAI-compatible LLM gateway) config, used only by /translate. ---
-# Never hardcode the key here — set it as an environment variable before starting
-# the server, e.g.:
-#   export BAZAARLINK_API_KEY=sk-bl-...      (macOS/Linux)
-#   $env:BAZAARLINK_API_KEY="sk-bl-..."      (Windows PowerShell)
-# or put it in a local .env file (git-ignored) and load it with python-dotenv.
-BAZAARLINK_API_KEY = os.getenv("BAZAARLINK_API_KEY")
-BAZAARLINK_MODEL = os.getenv("BAZAARLINK_MODEL")
-BAZAARLINK_URL = "https://bazaarlink.ai/api/v1/chat/completions"
-
-# Matches Arabic-script text (covers Urdu, since Urdu is written in a Perso-Arabic script).
-URDU_SCRIPT_RE = re.compile(r"[\u0600-\u06FF]")
+from fastapi.staticfiles import StaticFiles
+from fastapi import Request
+from transformers import pipeline
+from dotenv import load_dotenv
+from openai import OpenAI
+from typing import List, Optional, Tuple
+from contextlib import asynccontextmanager
+import asyncio
 
 
-def detect_lang(text: str) -> str:
-    """Cheap heuristic: any Arabic-script characters -> Urdu, else assume English."""
-    return "ur" if URDU_SCRIPT_RE.search(text) else "en"
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-dtype = torch.float16 if device == "cuda" else torch.float32
+# Change this env var if you want to swap models without editing code:
+#   ASR_MODEL_ID="openai/whisper-medium" python server.py
+MODEL_ID = os.environ.get("ASR_MODEL_ID", "Abdul145/whisper-medium-urdu-custom")
 
-app = FastAPI(title="Voice Ledger Backend")
+DEFAULT_API_KEY_ENV = "BAZARLINK_API_KEY"
 
-# The frontend runs on a different origin (e.g. localhost:5173) than the
-# backend (localhost:8000), so CORS must be open for local dev.
+
+def load_environment() -> None:
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    load_dotenv(env_path)
+
+
+def get_api_key(env_name: str) -> Optional[str]:
+    load_environment()
+    return os.getenv(env_name)
+
+
+def create_client(api_key: str) -> OpenAI:
+    return OpenAI(api_key=api_key, base_url="https://bazaarlink.ai/api/v1")
+
+
+def classify_message(client: OpenAI, message: str) -> dict:
+
+    response = client.chat.completions.create(
+        model="openai/gpt-4.1",
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {
+                "role": "system",
+                "content": """
+You are an Urdu assistant.
+Correct the urdu sentence if wrong.
+Extract NOTES and TASKS.
+
+Return ONLY JSON.
+
+Example:
+
+{
+    "corrected": "..."
+    "notes":[
+        "...",
+        "..."
+    ],
+    "tasks":[
+        "...",
+        "..."
+    ]
+}
+"""
+            },
+            {
+                "role": "user",
+                "content": message
+            }
+        ]
+    )
+
+    return json.loads(response.choices[0].message.content)
+
+
+device = 0 if torch.cuda.is_available() else -1
+print(f"Loading model '{MODEL_ID}' on {'GPU' if device == 0 else 'CPU'} ...")
+
+api_key = get_api_key("BAZARLINK_API_KEY")
+if not api_key:
+    sys.exit(1)
+
+
+def build_asr_pipeline(model_id: str, device_index: int):
+    """
+    Builds the ASR pipeline and makes sure the generation config actually
+    supports timestamp-based decoding. This custom checkpoint's
+    generation_config.json ships without the timestamp token ids, which is
+    what causes:
+
+        "You are trying to return timestamps, but the generation config is
+        not properly set..."
+
+    This happens because any audio longer than Whisper's 30s window forces
+    the pipeline into its chunked long-form decoding path, which requires
+    return_timestamps internally to stitch chunks back together.
+    """
+    asr = pipeline(
+        "automatic-speech-recognition",
+        model=model_id,
+        device=device_index,
+        chunk_length_s=30,   # enables long-form/chunked decoding explicitly
+        stride_length_s=5,   # overlap between chunks so words aren't cut off
+    )
+
+    # Patch the generation config so timestamp decoding actually works.
+    gen_config = asr.model.generation_config
+    tokenizer = asr.tokenizer
+
+    if getattr(gen_config, "no_timestamps_token_id", None) is None:
+        try:
+            gen_config.no_timestamps_token_id = tokenizer.convert_tokens_to_ids(
+                "<|notimestamps|>"
+            )
+        except Exception:
+            pass
+
+    # Make sure forced_decoder_ids isn't left over from an incompatible
+    # config -- it conflicts with passing language/task via generate_kwargs.
+    gen_config.forced_decoder_ids = None
+
+    # This checkpoint is a fine-tune trained specifically for Urdu, so we
+    # do NOT force `language="urdu"` at generate() time. Passing `language`
+    # requires the generation_config to carry multilingual mappings
+    # (lang_to_id / task_to_id / is_multilingual=True); many fine-tuned
+    # checkpoints ship without these, which triggers:
+    #   "The generation config is outdated and is thus not compatible
+    #    with the `language` argument to `generate`."
+    #
+    # Fallback: if you DO need to force the language (e.g. this checkpoint
+    # is actually multilingual), repair the config by pulling the
+    # multilingual mappings from the matching base Whisper checkpoint:
+    #
+    #   from transformers import GenerationConfig
+    #   base_gen_config = GenerationConfig.from_pretrained("openai/whisper-medium")
+    #   gen_config.lang_to_id = base_gen_config.lang_to_id
+    #   gen_config.task_to_id = base_gen_config.task_to_id
+    #   gen_config.is_multilingual = True
+    #
+    # then it's safe to pass generate_kwargs={"language": "urdu", "task": "transcribe"}
+    # again in the /transcribe endpoint below.
+
+    return asr
+
+
+@asynccontextmanager
+async def lifespan(app):
+
+    app.state.asr = build_asr_pipeline(
+        MODEL_ID,
+        0 if torch.cuda.is_available() else -1,
+    )
+
+    app.state.client = create_client(api_key)
+
+    print("Model loaded.")
+
+    yield
+
+    del app.state.asr
+    del app.state.client
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+print("Model loaded. Server ready.")
+
+app = FastAPI(title="Urdu ASR Server", lifespan=lifespan)
+
+# Wide-open CORS for local development. Tighten this if you expose the
+# server beyond your own machine.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -62,141 +187,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print(f"Loading {MODEL_ID} on {device} ({dtype}) ...")
-processor = AutoProcessor.from_pretrained(MODEL_ID)
-model = AutoModelForSpeechSeq2Seq.from_pretrained(MODEL_ID, torch_dtype=dtype)
-model.to(device)
-model.eval()
-
-print("Model loaded — ready.")
-
-# This checkpoint's bundled generation_config.json predates the newer
-# `language=`/`task=` API in `generate()` — it's missing the `lang_to_id`
-# mapping that API needs, which raises a "generation config is outdated"
-# error. Swap in a current generation config from the base model this was
-# fine-tuned from; the weights are untouched, only the generation settings
-# (language list, decoder-start behavior, etc.) are refreshed.
-BASE_MODEL_ID = "openai/whisper-medium"
-model.generation_config = GenerationConfig.from_pretrained(BASE_MODEL_ID)
-model.generation_config.forced_decoder_ids = None
-if hasattr(model.config, "forced_decoder_ids"):
-    model.config.forced_decoder_ids = None
+# Where uploaded/recorded audio gets saved before transcription.
+RECORDINGS_DIR = Path(os.environ.get("RECORDINGS_DIR", "recordings")).resolve()
+RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/recordings", StaticFiles(directory=str(RECORDINGS_DIR)), name="recordings")
+print(f"Storing audio in: {RECORDINGS_DIR}")
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": MODEL_ID}
-
-
-class TranslateRequest(BaseModel):
-    text: str
-    target: str | None = None  # "en" or "ur"; auto-detected from `text` if omitted
-
-
-@app.post("/translate")
-def translate(payload: TranslateRequest):
-    text = payload.text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Empty text")
-
-    if not BAZAARLINK_API_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="BAZAARLINK_API_KEY is not set. Export it as an environment "
-                   "variable before starting the server.",
-        )
-
-    source_lang = detect_lang(text)
-    target_lang = payload.target or ("en" if source_lang == "ur" else "ur")
-    target_name = "English" if target_lang == "en" else "Urdu"
-
-    try:
-        resp = requests.post(
-            BAZAARLINK_URL,
-            headers={
-                "Authorization": f"Bearer {BAZAARLINK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": BAZAARLINK_MODEL,
-                "temperature": 0,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            f"You are a translation engine. Translate the user's message into "
-                            f"{target_name}. Reply with ONLY the translation — no quotes, no "
-                            f"notes, no explanations."
-                        ),
-                    },
-                    {"role": "user", "content": text},
-                ],
-            },
-            timeout=30,
-        )
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=502, detail=f"Could not reach BazaarLink: {exc}") from exc
-
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"BazaarLink error ({resp.status_code}): {resp.text[:300]}",
-        )
-
-    data = resp.json()
-    try:
-        translated = data["choices"][0]["message"]["content"].strip()
-    except (KeyError, IndexError) as exc:
-        raise HTTPException(status_code=502, detail="Unexpected BazaarLink response shape") from exc
-
-    return {"translated": translated, "source_lang": source_lang, "target_lang": target_lang}
+    return {"status": "ok", "model": MODEL_ID, "device": "cuda" if device == 0 else "cpu"}
 
 
 @app.post("/transcribe")
-async def transcribe(file: UploadFile = File(...)):
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="Empty file")
-
+async def transcribe(request: Request, file: UploadFile = File(...)):
+    """
+    Saves the uploaded audio to RECORDINGS_DIR first, then transcribes
+    from that stored file. Expects mono 16kHz WAV (the frontend encodes
+    audio to this format client-side before uploading).
+    """
     try:
-        audio, sr = sf.read(io.BytesIO(raw), dtype="float32")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not read audio: {exc}") from exc
+        raw = await file.read()
+        if not raw:
+            raise HTTPException(status_code=400, detail="Empty audio upload.")
 
-    # Collapse to mono if needed.
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
+        # --- store first ---
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique = uuid.uuid4().hex[:8]
+        original_ext = Path(file.filename or "").suffix or ".wav"
+        stored_name = f"{timestamp}_{unique}{original_ext}"
+        stored_path = RECORDINGS_DIR / stored_name
+        stored_path.write_bytes(raw)
 
-    # The frontend already resamples to 16kHz mono before upload, but
-    # resample here too as a safety net for direct API calls.
-    if sr != TARGET_SR:
-        try:
+        # --- then transcribe from the stored file ---
+        audio, sr = sf.read(str(stored_path), dtype="float32")
+
+        if audio.ndim > 1:
+            audio = audio.mean(axis=1)
+
+        if sr != 16000:
             import librosa
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=TARGET_SR)
-        except ImportError:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Audio sample rate is {sr}Hz, expected {TARGET_SR}Hz, and librosa "
-                       "isn't installed to resample it.",
-            )
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
 
-    inputs = processor(audio, sampling_rate=TARGET_SR, return_tensors="pt")
-    input_features = inputs.input_features.to(device=device, dtype=dtype)
+        print("STORED PATH = ", stored_path)
+        rpath = os.path.join(RECORDINGS_DIR, stored_name)
+        print("RPATH = ", rpath)
 
-    with torch.no_grad():
-        # Newer `transformers` versions reject `forced_decoder_ids` as a
-        # generate() kwarg — pass language/task directly instead, which
-        # forces Urdu transcription (not translation) under the hood.
-        predicted_ids = model.generate(
-            input_features,
-            language="urdu",
-            task="transcribe",
+        result = await asyncio.to_thread(
+            request.app.state.asr,
+            rpath,
+            return_timestamps=True,
         )
 
-    text = processor.batch_decode(predicted_ids, skip_special_tokens=True)[0].strip()
+        with open("testing.txt", "w", encoding="utf-8") as fi:
+            fi.write(result["text"])
 
-    return {"text": text}
+        classification = await asyncio.to_thread(
+            classify_message,
+            request.app.state.client,
+            result["text"]
+        )
+
+        return {
+            "text": classification.get("corrected", []),
+            "filename": stored_name,
+            "url": f"/recordings/{stored_name}",
+            "classified_by": "ai",
+            "notes": classification.get("notes", []),
+            "tasks": classification.get("tasks", [])
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/recordings-list")
+def list_recordings():
+    """Returns stored recordings, most recent first."""
+    files = sorted(RECORDINGS_DIR.glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return {
+        "recordings": [
+            {"filename": f.name, "url": f"/recordings/{f.name}", "size_bytes": f.stat().st_size}
+            for f in files if f.is_file()
+        ]
+    }
 
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
