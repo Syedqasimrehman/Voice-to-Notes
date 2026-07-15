@@ -1,0 +1,30 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Nastaliq+Urdu:wght@400;700&family=Fraunces:ital,opsz,wght@0,9..144,400;0,9..144,600;1,9..144,500&family=Karla:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .vl-rtl {
+    font-family: 'Noto Nastaliq Urdu', serif;
+    direction: rtl;
+    text-align: right;
+  }
+}
+
+@layer components {
+  .pill-btn {
+    @apply inline-flex cursor-pointer items-center gap-[7px] rounded-full border border-vl-border
+      bg-vl-surface px-4 py-[9px] font-karla text-[13px] font-semibold text-vl-ink shadow-vl-xs
+      transition-all duration-200 hover:-translate-y-px hover:border-vl-amber hover:shadow-vl-sm;
+  }
+
+  .primary-btn {
+    @apply cursor-pointer rounded-full border-none bg-vl-amber px-[18px] py-[9px]
+      font-karla text-[13px] font-bold text-white shadow-vl-sm transition-colors hover:bg-vl-amber-bright;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
