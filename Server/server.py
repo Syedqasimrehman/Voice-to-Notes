@@ -239,9 +239,6 @@ async def transcribe(request: Request, file: UploadFile = File(...)):
             return_timestamps=True,
         )
 
-        with open("testing.txt", "w", encoding="utf-8") as fi:
-            fi.write(result["text"])
-
         classification = await asyncio.to_thread(
             classify_message,
             request.app.state.client,
@@ -277,4 +274,4 @@ def list_recordings():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=3400)
