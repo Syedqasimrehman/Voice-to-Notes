@@ -1,5 +1,5 @@
 .DS_Store
-server/.env
+Server/.env
 /node_modules/
 
 # React Router
@@ -9,3 +9,4 @@ Server/.vscode
 Frontend/.agents
 Frontend/.react-router
 Frontend/node_modules
+Frontend/src/hooks/useLedger.js.bak

@@ -1,0 +1,30 @@
+# version: "3.9"
+
+services:
+  voice_notes_api:
+    build: ./Server
+    container_name: voice_notes_api
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./Server/.env
+
+    volumes:
+      - ./Server:/
+
+  frontend:
+    build: ./Frontend
+    container_name: voice_to_notes_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      # Runs in the BROWSER, not inside Docker's network - so it must point
+      # at the backend's port as published on your host machine, not "api"
+      REACT_PUBLIC_API_URL: http://localhost:8000/
+    depends_on:
+      - voice_notes_api
+    volumes:
+      - ./Frontend:/app
+      - /app/node_modules
+
+# volumes:
