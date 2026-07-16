@@ -6,3 +6,6 @@ transformers
 soundfile
 librosa
 accelerate
+numpy
+python-dotenv
+openai
